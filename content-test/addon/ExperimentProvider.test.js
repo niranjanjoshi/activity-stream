@@ -1,12 +1,15 @@
 const createExperimentProvider = require("inject!addon/ExperimentProvider");
-const {OVERRIDE_PREF} = require("addon/ExperimentProvider");
-const {SimplePrefs} = require("shims/sdk/simple-prefs");
+const {PrefService} = require("shims/sdk/preferences/service");
+const PrefsTarget = require("shims/sdk/preferences/event-target");
+const {preferencesBranch} = require("sdk/self");
+const PREF_PREFIX = `extensions.${preferencesBranch}.`;
 
 const DEFAULT_OPTIONS = {
   clientID: "foo",
   experiments: {
     foo: {
       name: "Foo Test",
+      active: true,
       description: "A test about foo",
       control: {
         value: false,
@@ -24,31 +27,28 @@ const DEFAULT_OPTIONS = {
 
 describe("ExperimentProvider", () => {
   let experimentProvider;
-  let simplePrefs;
+  let prefService = new PrefService();
 
-  function setup(options = {}, customPrefs) {
-    const {clientID, experiments, n} = Object.assign({}, DEFAULT_OPTIONS, options);
-    simplePrefs = new SimplePrefs(customPrefs);
-    const {ExperimentProvider} = createExperimentProvider({"sdk/simple-prefs": simplePrefs});
-    experimentProvider = new ExperimentProvider(clientID, experiments, n && (() => n));
+  function setup(options = {}) {
+    const {experiments, n} = Object.assign({}, DEFAULT_OPTIONS, options);
+    const {ExperimentProvider} = createExperimentProvider({
+      "sdk/preferences/service": prefService,
+      "sdk/preferences/event-target": PrefsTarget
+    });
+    experimentProvider = new ExperimentProvider(experiments, n && (() => n));
     experimentProvider.init();
   }
 
   afterEach(() => {
     experimentProvider.destroy();
     experimentProvider = null;
-    simplePrefs = null;
+    prefService.setPrefs({});
   });
 
   it("should have the right properties", () => {
     setup();
-    assert.ok(experimentProvider._clientID, "should have a .clientID property");
     assert.ok(experimentProvider._rng, "should have a ._rng property");
     assert.ok(experimentProvider._data, "should have a ._data property");
-  });
-  it("should always generate the same number given a seed", () => {
-    setup({clientID: "foo"});
-    assert.equal(Math.round(experimentProvider._rng() * 100) / 100, 0.73, "should generate 0.73 with clientID foo");
   });
   it("should set .experimentId", () => {
     setup({n: 0.8});
@@ -59,13 +59,13 @@ describe("ExperimentProvider", () => {
     assert.equal(experimentProvider.experimentId, "foo_01", "should be foo_01 if in experiment");
   });
   it("should set .data ", () => {
-    setup({clientID: "baz"});
-    assert.equal(experimentProvider.data, experimentProvider._data, ".data should return return this._data");
-    assert.deepEqual(experimentProvider.data, {foo: DEFAULT_OPTIONS.experiments.foo.control.value}, "clientID 'baz' should result in control being picked");
+    setup({clientID: "baz", n: 0.6});
+    assert.equal(experimentProvider.data, experimentProvider._data, ".data should return this._data");
+    assert.deepEqual(experimentProvider.data.foo, DEFAULT_OPTIONS.experiments.foo.control.value, "should result in control being picked");
   });
   it("should set .data", () => {
-    setup({clientID: "012j"});
-    assert.deepEqual(experimentProvider.data, {foo: DEFAULT_OPTIONS.experiments.foo.variant.value}, "clientID '012j' should result in variant being picked");
+    setup({clientID: "012j", n: 0.3});
+    assert.deepEqual(experimentProvider.data.foo, DEFAULT_OPTIONS.experiments.foo.variant.value, "should result in variant being picked");
   });
   it("should throw if experiment cohorts add to > 1", () => {
     assert.throws(() => {
@@ -73,12 +73,14 @@ describe("ExperimentProvider", () => {
         experiments: {
           foo: {
             name: "foo",
+            active: true,
             description: "foo",
             control: {value: false, description: "foo"},
             variant: {id: "foo_01", value: true, threshold: 0.5, description: "foo"}
           },
           bar: {
             name: "bar",
+            active: true,
             description: "bar",
             control: {value: false, description: "bar"},
             variant: {id: "bar_01", value: true, threshold: 0.6, description: "bar"}
@@ -94,11 +96,13 @@ describe("ExperimentProvider", () => {
       experiments: {
         kitty: {
           name: "kitty",
+          active: true,
           control: {value: false},
           variant: {id: "kitty_01", threshold: 0.2, value: true}
         },
         dachshund: {
           name: "dachshund",
+          active: true,
           control: {value: false},
           variant: {id: "dachshund_01", threshold: 0.2, value: true}
         }
@@ -123,64 +127,107 @@ describe("ExperimentProvider", () => {
             value: "blah"
           }
         }
-      }
+      },
+      n: 0.1
     });
-    assert.deepEqual(experimentProvider.data, {}, "should have empty .data");
+    assert.equal(experimentProvider.data.foo, undefined, "foo is not selected");
   });
 
   describe("overrides", () => {
     it("should override experiments and not set an experimentId", () => {
-      const prefs = {};
-      prefs[OVERRIDE_PREF] = "foo";
-      setup(undefined, prefs);
-      assert.equal(experimentProvider.data.foo, DEFAULT_OPTIONS.experiments.foo.variant.value);
+      setup({n: 0.2});
+      assert.equal(experimentProvider.data.foo, true);
+      assert.equal(experimentProvider.experimentId, "foo_01");
+
+      prefService.set(`${PREF_PREFIX}foo`, false);
+      experimentProvider._onPrefChange();
+
+      assert.equal(experimentProvider.data.foo, DEFAULT_OPTIONS.experiments.foo.control.value);
       assert.equal(experimentProvider.experimentId, null);
     });
     it("should turn on an experiment even if it is active: false", () => {
-      const prefs = {};
-      prefs[OVERRIDE_PREF] = "foo";
-      setup(undefined, prefs);
+      setup({n: 0.8});
+      assert.equal(experimentProvider.data.foo, false);
+      assert.equal(experimentProvider.experimentId, null);
+
+      prefService.set(`${PREF_PREFIX}foo`, true);
+      experimentProvider._onPrefChange();
+
       assert.equal(experimentProvider.data.foo, DEFAULT_OPTIONS.experiments.foo.variant.value);
+      assert.equal(experimentProvider.experimentId, null);
     });
+    it["should enable a disabled experiment"] = assert => {
+      let data = {
+        clientID: "foo",
+        experiments: {
+          kitty: {
+            name: "kitty",
+            active: false,
+            control: {value: false},
+            variant: {id: "kitty_01", threshold: 0.2, value: true}
+          }
+        },
+        n: 0.1
+      };
+      setup(data);
+      assert.equal(experimentProvider.data.kitty, undefined);
+      assert.equal(experimentProvider.experimentId, null);
+
+      experimentProvider.destroy();
+      data.experiments.kitty.active = true;
+
+      setup(data);
+
+      assert.equal(experimentProvider.data.kitty, true);
+      assert.equal(experimentProvider.experimentId, "kitty_01");
+    };
     it("should override multiple experiments", () => {
-      const prefs = {};
-      prefs[OVERRIDE_PREF] = "foo, bar";
       setup({
         experiments: {
           foo: {
             name: "foo",
+            active: true,
             description: "foo",
             control: {value: false, description: "foo"},
             variant: {id: "foo_01", value: true, threshold: 0.2, description: "foo"}
           },
           bar: {
             name: "bar",
+            active: true,
             description: "bar",
             control: {value: false, description: "bar"},
             variant: {id: "bar_01", value: true, threshold: 0.2, description: "bar"}
           }
-        }
-      }, prefs);
-      assert.isTrue(experimentProvider.data.foo);
-      assert.isTrue(experimentProvider.data.bar);
+        },
+        n: 0.4
+      });
+      assert.equal(experimentProvider.data.foo, false);
+      assert.equal(experimentProvider.data.bar, false);
+
+      prefService.set(`${PREF_PREFIX}foo`, true);
+      prefService.set(`${PREF_PREFIX}bar`, true);
+      experimentProvider._onPrefChange();
+
+      assert.equal(experimentProvider.data.foo, true);
+      assert.equal(experimentProvider.data.bar, true);
       assert.equal(experimentProvider.experimentId, null);
     });
-    it("should add a pref listener on experimentOverrides", () => {
-      setup();
-      assert.calledWith(simplePrefs.on, OVERRIDE_PREF);
+    it("should add a pref listener on new, active experiments", () => {
+      setup({n: 0.3});
+      assert.calledWith(experimentProvider._target.on, `${PREF_PREFIX}foo`);
     });
-    it("should remove the pref listener on experimentOverrides and reset data, experimentId", () => {
-      setup();
+    it("should remove the pref listener on experiment prefs and reset experimentId", () => {
+      setup({n: 0.1});
       experimentProvider.destroy();
-      assert.calledWith(simplePrefs.off, OVERRIDE_PREF);
+      assert.calledWith(experimentProvider._target.off, `${PREF_PREFIX}foo`);
       assert.isNull(experimentProvider.experimentId);
-      assert.deepEqual(experimentProvider.data, {});
     });
     it("should reset experiments on a pref change", () => {
       setup({
         experiments: {
           foo: {
             name: "foo",
+            active: true,
             description: "foo",
             control: {value: false, description: "foo"},
             variant: {id: "foo_01", value: true, threshold: 0.2, description: "foo"}
@@ -188,9 +235,80 @@ describe("ExperimentProvider", () => {
         }
       });
       assert.isFalse(experimentProvider.data.foo);
-      simplePrefs.prefs[OVERRIDE_PREF] = "foo";
+      prefService.set(`${PREF_PREFIX}foo`, true);
       experimentProvider._onPrefChange();
       assert.isTrue(experimentProvider.data.foo);
+    });
+    it("should disable experiment with participating user", () => {
+      let data = {
+        clientID: "foo",
+        experiments: {
+          kitty: {
+            name: "kitty",
+            active: true,
+            control: {value: false},
+            variant: {id: "kitty_01", threshold: 0.2, value: true}
+          }
+        },
+        n: 0.1
+      };
+      setup(data);
+      assert.equal(experimentProvider.data.kitty, true);
+      assert.equal(experimentProvider.experimentId, "kitty_01");
+
+      experimentProvider.destroy();
+
+      assert.equal(experimentProvider.data.kitty, true);
+      assert.equal(experimentProvider.experimentId, null);
+
+      data.experiments.kitty.active = false;
+      setup(data);
+
+      assert.equal(experimentProvider.data.kitty, false);
+      assert.equal(experimentProvider.experimentId, null);
+
+      // Reactivating an experiment that a user was in that became
+      // inactive should not re-consider that user.
+      data.experiments.kitty.active = true;
+      experimentProvider.destroy();
+      setup(data);
+
+      assert.equal(experimentProvider.data.kitty, false);
+      assert.equal(experimentProvider.experimentId, null);
+    });
+    it("should make new experiment available", () => {
+      let data = {
+        clientID: "foo",
+        experiments: {
+          kitty: {
+            name: "kitty",
+            active: true,
+            control: {value: false},
+            variant: {id: "kitty_01", threshold: 0.2, value: true}
+          }
+        },
+        n: 0.3
+      };
+      setup(data);
+      assert.equal(experimentProvider.data.kitty, false);
+      assert.equal(experimentProvider.experimentId, null);
+
+      experimentProvider.destroy();
+      data.experiments.dachshund = {
+        name: "dachshund",
+        active: true,
+        control: {value: false},
+        variant: {id: "dachshund_01", threshold: 0.2, value: true}
+      };
+      data.n = 0.1;
+
+      setup(data);
+
+      // We weren't in the kitty experiment initally, so we will stay
+      // out of it even though our new random number would normally choose kitty.
+      assert.equal(experimentProvider.data.kitty, false);
+      assert.equal(experimentProvider.data.dachshund, true);
+      assert.equal(experimentProvider.experimentId, "dachshund_01");
     });
   });
 });

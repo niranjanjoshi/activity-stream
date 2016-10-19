@@ -80,7 +80,6 @@ function ActivityStreams(metadataStore, tabTracker, telemetrySender, options = {
   this._newTabURL = `${this.options.pageURL}#/`;
   Services.prefs.setIntPref("places.favicons.optimizeToDimension", 64);
   this._experimentProvider = new ExperimentProvider(
-    options.clientID,
     options.experiments,
     options.rng
   );
@@ -834,6 +833,7 @@ ActivityStreams.prototype = {
       case "disable":
       case "uninstall":
         this._tabTracker.handleUserEvent({event: reason});
+        this._experimentProvider.clearPrefs();
         this._unsetHomePage();
         defaultUnload();
         break;
